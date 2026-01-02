@@ -3,26 +3,24 @@ import logging
 import requests
 import os
 import json
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 from dataclasses import dataclass, asdict
-from datetime import datetime, timedelta
+from datetime import datetime
 from flask import Flask, request, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# Initialize Flask app
 app = Flask(__name__)
 
 @dataclass
 class Trade:
-    """Trade data structure"""
+    """Trade data"""
     id: str
     symbol: str
     direction: str
@@ -43,7 +41,6 @@ class Trade:
     strict_mode: bool
     timestamp: str
     
-    # Trade status
     tp1_hit: bool = False
     tp2_hit: bool = False
     tp3_hit: bool = False
@@ -52,65 +49,114 @@ class Trade:
     final_result: str = "ACTIVE"
     profit_r: float = 0.0
     
+    # FIXED: Track which notifications have been SENT
+    tp1_notified: bool = False
+    tp2_notified: bool = False
+    tp3_notified: bool = False
+    sl_notified: bool = False
+    
     def to_dict(self):
         return asdict(self)
 
 class TradeTracker:
-    """Track all trades for daily/weekly summaries"""
+    """Track all trades"""
     
     def __init__(self):
         self.active_trades: Dict[str, Trade] = {}
         self.closed_trades: List[Trade] = []
         self.daily_trades: List[Trade] = []
         self.weekly_trades: List[Trade] = []
+        
+        # FIXED: Track which trade IDs have already received each TP/SL
+        self.tp1_sent: Set[str] = set()
+        self.tp2_sent: Set[str] = set()
+        self.tp3_sent: Set[str] = set()
+        self.sl_sent: Set[str] = set()
     
     def add_trade(self, trade: Trade):
         """Add new trade"""
         self.active_trades[trade.id] = trade
         self.daily_trades.append(trade)
         self.weekly_trades.append(trade)
-        logger.info(f"📊 Added trade to tracker: {trade.id}")
+        logger.info(f"📊 Added trade: {trade.id}")
+    
+    def should_send_tp1(self, trade_id: str) -> bool:
+        """Check if TP1 notification should be sent"""
+        if trade_id in self.tp1_sent:
+            logger.info(f"⏭️ TP1 already sent for {trade_id}")
+            return False
+        self.tp1_sent.add(trade_id)
+        return True
+    
+    def should_send_tp2(self, trade_id: str) -> bool:
+        """Check if TP2 notification should be sent"""
+        if trade_id in self.tp2_sent:
+            logger.info(f"⏭️ TP2 already sent for {trade_id}")
+            return False
+        self.tp2_sent.add(trade_id)
+        return True
+    
+    def should_send_tp3(self, trade_id: str) -> bool:
+        """Check if TP3 notification should be sent"""
+        if trade_id in self.tp3_sent:
+            logger.info(f"⏭️ TP3 already sent for {trade_id}")
+            return False
+        self.tp3_sent.add(trade_id)
+        return True
+    
+    def should_send_sl(self, trade_id: str) -> bool:
+        """Check if SL notification should be sent"""
+        if trade_id in self.sl_sent:
+            logger.info(f"⏭️ SL already sent for {trade_id}")
+            return False
+        self.sl_sent.add(trade_id)
+        return True
     
     def update_trade_tp(self, trade_id: str, level: str, price: float):
-        """Update trade when TP is hit"""
+        """Update trade TP"""
         if trade_id in self.active_trades:
             trade = self.active_trades[trade_id]
             
-            if level == "TP1":
+            if level == "TP1" and not trade.tp1_notified:
                 trade.tp1_hit = True
+                trade.tp1_notified = True
                 trade.profit_r = 1.5
-            elif level == "TP2":
+            elif level == "TP2" and not trade.tp2_notified:
                 trade.tp2_hit = True
+                trade.tp2_notified = True
                 trade.profit_r = 2.5
-            elif level == "TP3":
+            elif level == "TP3" and not trade.tp3_notified:
                 trade.tp3_hit = True
+                trade.tp3_notified = True
                 trade.final_result = "TP3"
                 trade.profit_r = 4.0
                 trade.closed = True
                 self.close_trade(trade_id)
             
-            logger.info(f"✅ Updated trade {trade_id}: {level} hit")
+            logger.info(f"✅ {trade_id}: {level} hit")
     
     def update_trade_sl(self, trade_id: str):
-        """Update trade when SL is hit"""
+        """Update trade SL"""
         if trade_id in self.active_trades:
             trade = self.active_trades[trade_id]
-            trade.sl_hit = True
-            trade.final_result = "SL"
-            trade.profit_r = -1.0
-            trade.closed = True
-            self.close_trade(trade_id)
-            logger.info(f"❌ Updated trade {trade_id}: SL hit")
+            if not trade.sl_notified:
+                trade.sl_hit = True
+                trade.sl_notified = True
+                trade.final_result = "SL"
+                trade.profit_r = -1.0
+                trade.closed = True
+                self.close_trade(trade_id)
+                logger.info(f"❌ {trade_id}: SL hit")
     
     def close_trade(self, trade_id: str):
-        """Move trade from active to closed"""
+        """Close trade"""
         if trade_id in self.active_trades:
             trade = self.active_trades.pop(trade_id)
             self.closed_trades.append(trade)
-            logger.info(f"🔒 Closed trade: {trade_id}")
+            logger.info(f"🔒 Closed: {trade_id}")
     
     def get_daily_stats(self) -> Dict:
-        """Get daily statistics"""
+        """Daily stats"""
         if not self.daily_trades:
             return None
         
@@ -118,20 +164,15 @@ class TradeTracker:
         closed = [t for t in self.daily_trades if t.closed]
         
         if not closed:
-            return {
-                "total_signals": total,
-                "closed_trades": 0,
-                "active_trades": total
-            }
+            return {"total_signals": total, "closed_trades": 0, "active_trades": total}
         
-        tp3_count = len([t for t in closed if t.final_result == "TP3"])
-        tp2_count = len([t for t in closed if t.final_result == "TP2"])
-        tp1_count = len([t for t in closed if t.final_result == "TP1"])
-        sl_count = len([t for t in closed if t.final_result == "SL"])
+        tp3 = len([t for t in closed if t.final_result == "TP3"])
+        tp2 = len([t for t in closed if t.final_result == "TP2"])
+        tp1 = len([t for t in closed if t.final_result == "TP1"])
+        sl = len([t for t in closed if t.final_result == "SL"])
         
-        wins = tp3_count + tp2_count + tp1_count
-        win_rate = (wins / len(closed) * 100) if closed else 0
-        
+        wins = tp3 + tp2 + tp1
+        wr = (wins / len(closed) * 100) if closed else 0
         total_r = sum([t.profit_r for t in closed])
         avg_r = total_r / len(closed) if closed else 0
         
@@ -139,20 +180,19 @@ class TradeTracker:
             "total_signals": total,
             "closed_trades": len(closed),
             "active_trades": total - len(closed),
-            "tp3_count": tp3_count,
-            "tp2_count": tp2_count,
-            "tp1_count": tp1_count,
-            "sl_count": sl_count,
+            "tp3_count": tp3,
+            "tp2_count": tp2,
+            "tp1_count": tp1,
+            "sl_count": sl,
             "wins": wins,
-            "losses": sl_count,
-            "win_rate": win_rate,
+            "losses": sl,
+            "win_rate": wr,
             "total_r": total_r,
-            "avg_r": avg_r,
-            "trades": self.daily_trades
+            "avg_r": avg_r
         }
     
     def get_weekly_stats(self) -> Dict:
-        """Get weekly statistics"""
+        """Weekly stats"""
         if not self.weekly_trades:
             return None
         
@@ -160,92 +200,85 @@ class TradeTracker:
         closed = [t for t in self.weekly_trades if t.closed]
         
         if not closed:
-            return {
-                "total_signals": total,
-                "closed_trades": 0,
-                "active_trades": total
-            }
+            return {"total_signals": total, "closed_trades": 0, "active_trades": total}
         
-        tp3_count = len([t for t in closed if t.final_result == "TP3"])
-        tp2_count = len([t for t in closed if t.final_result == "TP2"])
-        tp1_count = len([t for t in closed if t.final_result == "TP1"])
-        sl_count = len([t for t in closed if t.final_result == "SL"])
+        tp3 = len([t for t in closed if t.final_result == "TP3"])
+        tp2 = len([t for t in closed if t.final_result == "TP2"])
+        tp1 = len([t for t in closed if t.final_result == "TP1"])
+        sl = len([t for t in closed if t.final_result == "SL"])
         
-        wins = tp3_count + tp2_count + tp1_count
-        win_rate = (wins / len(closed) * 100) if closed else 0
-        
+        wins = tp3 + tp2 + tp1
+        wr = (wins / len(closed) * 100) if closed else 0
         total_r = sum([t.profit_r for t in closed])
         avg_r = total_r / len(closed) if closed else 0
         
-        by_symbol = {}
+        by_sym = {}
         for t in closed:
-            if t.symbol not in by_symbol:
-                by_symbol[t.symbol] = {"wins": 0, "losses": 0, "total_r": 0}
+            if t.symbol not in by_sym:
+                by_sym[t.symbol] = {"wins": 0, "losses": 0, "total_r": 0}
             if t.final_result in ["TP1", "TP2", "TP3"]:
-                by_symbol[t.symbol]["wins"] += 1
+                by_sym[t.symbol]["wins"] += 1
             else:
-                by_symbol[t.symbol]["losses"] += 1
-            by_symbol[t.symbol]["total_r"] += t.profit_r
+                by_sym[t.symbol]["losses"] += 1
+            by_sym[t.symbol]["total_r"] += t.profit_r
         
         return {
             "total_signals": total,
             "closed_trades": len(closed),
             "active_trades": total - len(closed),
-            "tp3_count": tp3_count,
-            "tp2_count": tp2_count,
-            "tp1_count": tp1_count,
-            "sl_count": sl_count,
+            "tp3_count": tp3,
+            "tp2_count": tp2,
+            "tp1_count": tp1,
+            "sl_count": sl,
             "wins": wins,
-            "losses": sl_count,
-            "win_rate": win_rate,
+            "losses": sl,
+            "win_rate": wr,
             "total_r": total_r,
             "avg_r": avg_r,
-            "by_symbol": by_symbol,
-            "trades": self.weekly_trades
+            "by_symbol": by_sym
         }
     
     def reset_daily(self):
-        """Reset daily trades"""
+        """Reset daily"""
         self.daily_trades = []
-        logger.info("🔄 Daily trades reset")
+        logger.info("🔄 Daily reset")
     
     def reset_weekly(self):
-        """Reset weekly trades"""
+        """Reset weekly"""
         self.weekly_trades = []
-        logger.info("🔄 Weekly trades reset")
+        self.tp1_sent.clear()
+        self.tp2_sent.clear()
+        self.tp3_sent.clear()
+        self.sl_sent.clear()
+        logger.info("🔄 Weekly reset")
 
 class TelegramNotifier:
-    """Handle Telegram notifications"""
+    """Telegram notifications"""
     
     def __init__(self, bot_token: str, chat_id: str):
         self.bot_token = bot_token
         self.chat_id = chat_id
         self.base_url = f"https://api.telegram.org/bot{bot_token}/"
         
-    def send_message(self, text: str, parse_mode: str = "HTML", disable_notification: bool = False):
-        """Send message to Telegram"""
+    def send_message(self, text: str, parse_mode: str = "HTML"):
+        """Send message"""
         try:
             url = f"{self.base_url}sendMessage"
-            payload = {
-                "chat_id": self.chat_id,
-                "text": text,
-                "parse_mode": parse_mode,
-                "disable_notification": disable_notification
-            }
+            payload = {"chat_id": self.chat_id, "text": text, "parse_mode": parse_mode}
             
             response = requests.post(url, json=payload, timeout=10)
             if response.status_code == 200:
-                logger.info("✅ Telegram message sent successfully")
+                logger.info("✅ Telegram sent")
                 return True
             else:
-                logger.error(f"❌ Failed to send Telegram message: {response.text}")
+                logger.error(f"❌ Telegram failed: {response.text}")
                 return False
         except Exception as e:
-            logger.error(f"❌ Error sending Telegram message: {e}")
+            logger.error(f"❌ Error: {e}")
             return False
     
     def send_elite_signal(self, data: Dict):
-        """Send Elite Edition signal"""
+        """Send signal"""
         try:
             symbol = data.get('symbol', 'UNKNOWN')
             direction = data.get('direction', 'UNKNOWN')
@@ -261,41 +294,40 @@ class TelegramNotifier:
             session = data.get('session', 'UNKNOWN')
             timeframe = data.get('timeframe', '?')
             bubble_strength = data.get('bubble_strength', 0)
-            exhaustion_detected = data.get('exhaustion_detected', False)
-            htf_trend = data.get('htf_trend', 'UNKNOWN')
-            strict_mode = data.get('strict_mode', False)
+            exhaustion = data.get('exhaustion_detected', False)
+            htf = data.get('htf_trend', 'UNKNOWN')
             
-            if direction == "LONG":
-                direction_emoji = "🟢"
-                direction_text = "LONG / BUY"
-                header_emoji = "🚀"
-            else:
-                direction_emoji = "🔴"
-                direction_text = "SHORT / SELL"
-                header_emoji = "📉"
+            dir_emoji = "🟢" if direction == "LONG" else "🔴"
+            dir_text = "LONG / BUY" if direction == "LONG" else "SHORT / SELL"
+            head_emoji = "🚀" if direction == "LONG" else "📉"
             
-            type_emoji = "🔄" if signal_type == "REVERSAL" else "➡️"
+            type_emoji = "🔄" if signal_type == "REVERSAL" else "⚡" if signal_type == "QUICK_SCALP" else "➡️"
             
-            if bubble_strength == 3:
-                bubble_text = "⚡⚡⚡ LEVEL 3 (INSTITUTIONAL!)"
+            if bubble_strength == 5:
+                bubble_text = "⚡⚡⚡⚡⚡ LEVEL 5 (HOLY GRAIL!)"
+            elif bubble_strength == 4:
+                bubble_text = "⚡⚡⚡⚡ LEVEL 4 (EXTREME)"
+            elif bubble_strength == 3:
+                bubble_text = "⚡⚡⚡ LEVEL 3 (STRONG)"
             elif bubble_strength == 2:
-                bubble_text = "⚡⚡ LEVEL 2 (STRONG)"
+                bubble_text = "⚡⚡ LEVEL 2"
             else:
                 bubble_text = "⚡ LEVEL 1"
             
-            exhaustion_text = "⚠️ DETECTED" if exhaustion_detected else "None"
+            exh_text = "⚠️ YES" if exhaustion else "None"
             
-            if score >= 95:
+            if score >= 90:
                 score_emoji = "🔥🔥🔥"
                 quality = "EXCEPTIONAL"
-            elif score >= 90:
+            elif score >= 80:
                 score_emoji = "🔥🔥"
                 quality = "EXCELLENT"
-            else:
+            elif score >= 70:
                 score_emoji = "🔥"
                 quality = "GOOD"
-            
-            mode_text = "🎯 STRICT ELITE" if strict_mode else "⚖️ BALANCED"
+            else:
+                score_emoji = "✅"
+                quality = "VALID"
             
             def fmt(price):
                 if "XAU" in symbol or "XAG" in symbol:
@@ -312,11 +344,11 @@ class TelegramNotifier:
             rr3 = abs(tp3 - entry) / risk if risk > 0 else 0
             
             message = f"""
-<b>⚡ NEURAL ICC AI 2026 • {mode_text}</b>
+<b>⚡ QUANTUM FUSION</b>
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-{header_emoji} <b>{symbol} • {timeframe}</b>
-{direction_emoji} <b>{direction_text}</b>
+{head_emoji} <b>{symbol} • {timeframe}</b>
+{dir_emoji} <b>{dir_text}</b>
 {type_emoji} <b>{signal_type}</b> • {pattern}
 
 <b>📊 ENTRY</b>
@@ -332,11 +364,11 @@ class TelegramNotifier:
 <b>🧠 ANALYSIS</b>
 ├ Score: {score_emoji} {score}/100 ({quality})
 ├ Session: {session}
-└ HTF: {htf_trend}
+└ HTF: {htf}
 
 <b>💎 SMART MONEY</b>
 ├ Bubble: {bubble_text}
-└ Exhaustion: {exhaustion_text}
+└ Exhaustion: {exh_text}
 
 <b>📋 MANAGEMENT</b>
 ├ <i>TP1: Move SL to BE</i>
@@ -353,7 +385,7 @@ class TelegramNotifier:
             return False
     
     def send_tp1_hit(self, data: Dict):
-        """TP1 hit - Move to BE"""
+        """TP1 hit"""
         try:
             symbol = data.get('symbol', 'UNKNOWN')
             direction = data.get('direction', 'UNKNOWN')
@@ -390,7 +422,7 @@ Lock in risk-free trade!
             return False
     
     def send_tp2_hit(self, data: Dict):
-        """TP2 hit - Trail SL"""
+        """TP2 hit"""
         try:
             symbol = data.get('symbol', 'UNKNOWN')
             direction = data.get('direction', 'UNKNOWN')
@@ -426,7 +458,7 @@ Lock in risk-free trade!
             return False
     
     def send_tp3_hit(self, data: Dict):
-        """TP3 hit - Full target"""
+        """TP3 hit"""
         try:
             symbol = data.get('symbol', 'UNKNOWN')
             direction = data.get('direction', 'UNKNOWN')
@@ -486,7 +518,7 @@ Exceptional execution!
 
 Controlled loss. Part of trading.
 
-85-95% win rate means next setup has high probability.
+Next setup has high probability.
 
 <i>Wait for next signal.</i>
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -501,36 +533,23 @@ Controlled loss. Part of trading.
         """Daily summary"""
         try:
             if not stats:
-                msg = """
-<b>📊 DAILY SUMMARY</b>
+                msg = """<b>📊 DAILY SUMMARY</b>
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
 No trades today.
-
-Quality over quantity.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-"""
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
             else:
                 if stats['closed_trades'] == 0:
-                    msg = f"""
-<b>📊 DAILY SUMMARY</b>
+                    msg = f"""<b>📊 DAILY SUMMARY</b>
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
 Signals: {stats['total_signals']}
 Active: {stats['active_trades']}
-
 Trades still running.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-"""
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
                 else:
                     wr = stats['win_rate']
                     emoji = "🔥" if wr >= 80 else "✅"
-                    msg = f"""
-<b>📊 DAILY SUMMARY</b>
+                    msg = f"""<b>📊 DAILY SUMMARY</b>
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
 Signals: {stats['total_signals']}
 Closed: {stats['closed_trades']}
 Active: {stats['active_trades']}
@@ -546,8 +565,7 @@ SL: {stats['sl_count']}
 
 {datetime.now().strftime('%Y-%m-%d')}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#Daily #NeuralICC
-"""
+#Daily #QuantumFusion"""
             return self.send_message(msg)
         except Exception as e:
             logger.error(f"❌ Error: {e}")
@@ -557,25 +575,17 @@ SL: {stats['sl_count']}
         """Weekly summary"""
         try:
             if not stats:
-                msg = """
-<b>📊 WEEKLY SUMMARY</b>
+                msg = """<b>📊 WEEKLY SUMMARY</b>
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
 No trades this week.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-"""
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
             else:
                 if stats['closed_trades'] == 0:
-                    msg = f"""
-<b>📊 WEEKLY SUMMARY</b>
+                    msg = f"""<b>📊 WEEKLY SUMMARY</b>
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
 Signals: {stats['total_signals']}
 All active.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-"""
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
                 else:
                     wr = stats['win_rate']
                     emoji = "🔥🔥🔥" if wr >= 85 else "🔥🔥" if wr >= 75 else "🔥"
@@ -584,10 +594,8 @@ All active.
                     for sym, d in stats['by_symbol'].items():
                         by_sym += f"├ {sym}: {d['wins']}W/{d['losses']}L ({d['total_r']:+.1f}R)\n"
                     
-                    msg = f"""
-<b>📊 WEEKLY SUMMARY</b>
+                    msg = f"""<b>📊 WEEKLY SUMMARY</b>
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
 Signals: {stats['total_signals']}
 Closed: {stats['closed_trades']}
 Active: {stats['active_trades']}
@@ -602,17 +610,15 @@ TP1: {stats['tp1_count']}
 SL: {stats['sl_count']}
 
 <b>By Asset:</b>
-{by_sym}
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#Weekly #NeuralICC
-"""
+{by_sym}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#Weekly #QuantumFusion"""
             return self.send_message(msg)
         except Exception as e:
             logger.error(f"❌ Error: {e}")
             return False
 
 class TradingBot:
-    """Enhanced bot with tracking"""
+    """Bot with fixed TP/SL tracking"""
     
     def __init__(self):
         self.telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -630,40 +636,27 @@ class TradingBot:
     def setup_scheduler(self):
         """Setup summaries"""
         self.scheduler = BackgroundScheduler()
-        
-        # Daily at 23:59 UTC
-        self.scheduler.add_job(
-            self.send_daily_summary,
-            CronTrigger(hour=23, minute=59),
-            id='daily'
-        )
-        
-        # Weekly Sunday 23:59 UTC
-        self.scheduler.add_job(
-            self.send_weekly_summary,
-            CronTrigger(day_of_week='sun', hour=23, minute=59),
-            id='weekly'
-        )
-        
+        self.scheduler.add_job(self.send_daily_summary, CronTrigger(hour=23, minute=59), id='daily')
+        self.scheduler.add_job(self.send_weekly_summary, CronTrigger(day_of_week='sun', hour=23, minute=59), id='weekly')
         self.scheduler.start()
         logger.info("⏰ Scheduler started")
     
     def send_daily_summary(self):
-        """Send daily"""
+        """Daily"""
         stats = self.tracker.get_daily_stats()
         if self.telegram:
             self.telegram.send_daily_summary(stats)
         self.tracker.reset_daily()
     
     def send_weekly_summary(self):
-        """Send weekly"""
+        """Weekly"""
         stats = self.tracker.get_weekly_stats()
         if self.telegram:
             self.telegram.send_weekly_summary(stats)
         self.tracker.reset_weekly()
     
     def process_webhook(self, data: Dict) -> bool:
-        """Process webhook"""
+        """Process webhook - FIXED: Only send each TP/SL once"""
         try:
             logger.info(f"📥 Webhook: {data}")
             
@@ -706,6 +699,18 @@ class TradingBot:
                 trade_id = data.get('id', 'unknown')
                 price = float(data.get('price', 0))
                 
+                # FIXED: Check if already sent
+                should_send = False
+                if level == "TP1":
+                    should_send = self.tracker.should_send_tp1(trade_id)
+                elif level == "TP2":
+                    should_send = self.tracker.should_send_tp2(trade_id)
+                elif level == "TP3":
+                    should_send = self.tracker.should_send_tp3(trade_id)
+                
+                if not should_send:
+                    return True  # Already sent, skip
+                
                 self.tracker.update_trade_tp(trade_id, level, price)
                 
                 if self.telegram:
@@ -720,6 +725,10 @@ class TradingBot:
             elif event == 'SL_HIT':
                 logger.info("❌ SL_HIT")
                 trade_id = data.get('id', 'unknown')
+                
+                # FIXED: Check if already sent
+                if not self.tracker.should_send_sl(trade_id):
+                    return True  # Already sent, skip
                 
                 self.tracker.update_trade_sl(trade_id)
                 
@@ -741,7 +750,7 @@ bot = TradingBot()
 
 @app.route('/')
 def home():
-    return "⚡ Neural ICC STRICT ELITE Bot 🟢", 200
+    return "⚡ Quantum Fusion Bot 🟢", 200
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
