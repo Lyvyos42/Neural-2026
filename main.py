@@ -99,7 +99,7 @@ class TelegramNotifier:
             # Safe Data Extraction
             symbol = data.get('symbol', 'UNKNOWN')
             direction = data.get('direction', 'UNKNOWN')
-            trigger = data.get('trigger', 'SMC SETUP').replace('_', ' ')
+            trigger = data.get('trigger', 'SMC_SETUP').replace('_', ' ')
             timeframe = data.get('timeframe', 'M5')
             session = data.get('session', 'LONDON').replace('_', ' ')
             zone = data.get('zone', 'EQ')
